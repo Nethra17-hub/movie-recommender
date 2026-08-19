@@ -6,9 +6,12 @@ from sklearn.metrics.pairwise import cosine_similarity
 import requests
 import os
 from dotenv import load_dotenv
+import sqlite3
 
-load_dotenv()
-OMDB_API_KEY = os.getenv("OMDB_API_KEY")
+from database import get_connection, init_db
+
+init_db()  # creates the table if it doesn't exist yet
+
 
 app = FastAPI()
 
@@ -36,25 +39,38 @@ def clean_title_for_search(title):
     """MovieLens titles look like 'Toy Story (1995)' - extract just the name + year"""
     return title.strip()
 
+load_dotenv()
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+
 def get_poster(title):
     if title in poster_cache:
         return poster_cache[title]
 
-    if not OMDB_API_KEY:
+    if not TMDB_API_KEY:
+        print("DEBUG: TMDB_API_KEY is missing or empty! Value:", TMDB_API_KEY)
         return None
+
+    import re
+    clean_title = re.sub(r'\s*\(\d{4}\)\s*$', '', title).strip()
 
     try:
         response = requests.get(
-            "http://www.omdbapi.com/",
-            params={"t": title, "apikey": OMDB_API_KEY},
+            "https://api.themoviedb.org/3/search/movie",
+            params={"api_key": TMDB_API_KEY, "query": clean_title},
             timeout=5
         )
         data = response.json()
-        poster_url = data.get("Poster") if data.get("Poster") != "N/A" else None
-        poster_cache[title] = poster_url
-        return poster_url
-    except Exception:
-        return None
+        print("DEBUG:", title, "->", data)
+        results = data.get("results", [])
+        if results and results[0].get("poster_path"):
+            poster_url = "https://image.tmdb.org/t/p/w500" + results[0]["poster_path"]
+            poster_cache[title] = poster_url
+            return poster_url
+    except Exception as e:
+        print("DEBUG ERROR:", e)
+
+    poster_cache[title] = None
+    return None
 
 @app.get("/")
 def home():
@@ -63,6 +79,44 @@ def home():
 @app.get("/movies")
 def get_all_movies():
     return movies[['title', 'genres']].to_dict(orient='records')
+
+@app.get("/search")
+def search_movies(q: str, limit: int = 8):
+    if not q or len(q) < 1:
+        return []
+    matches = movies[movies['title'].str.contains(q, case=False, na=False, regex=False)]
+    return matches[['title', 'genres']].head(limit).to_dict(orient='records')
+@app.get("/watchlist")
+def get_watchlist():
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM watchlist ORDER BY added_at DESC").fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+@app.post("/watchlist/{title}")
+def add_to_watchlist(title: str):
+    if title not in indices:
+        raise HTTPException(status_code=404, detail="Movie not found")
+    genres = movies.loc[indices[title], 'genres']
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO watchlist (movie_title, movie_genres) VALUES (?, ?)",
+            (title, genres)
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass  # already in watchlist, ignore
+    conn.close()
+    return {"message": f"'{title}' added to watchlist"}
+
+@app.delete("/watchlist/{title}")
+def remove_from_watchlist(title: str):
+    conn = get_connection()
+    conn.execute("DELETE FROM watchlist WHERE movie_title = ?", (title,))
+    conn.commit()
+    conn.close()
+    return {"message": f"'{title}' removed from watchlist"}
 
 @app.get("/recommend/{title}")
 def recommend(title: str, num: int = 5):
